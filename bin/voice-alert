@@ -1,0 +1,303 @@
+#!/bin/bash
+# voice-alert — macOS 语音提醒（DeepSeek Harness 用）
+set -uo pipefail
+
+STATE="$HOME/.dsh/state/voice-alert"
+LOCK="$STATE/lock"
+LOG="$STATE/log.tsv"
+STOP="$STATE/stop"
+WATCH_FILE="$STATE/watch"
+DEFAULT_VOICE=""
+VOICE_CACHE="$STATE/voice"
+SOUNDS="/System/Library/Sounds"
+STARTED=$(date +%s)
+VERSION="1.0.0"
+
+mkdir -p "$STATE"
+
+probe_voice() {
+  [ -z "@@{1:-}" ] && return 1
+  local tmp
+  tmp=$(mktemp -t va) || return 1
+  if say -v "$1" -o "$tmp" "a" >/dev/null 2>&1; then rm -f "$tmp"; return 0; fi
+  rm -f "$tmp"; return 1
+}
+
+detect_voice() {
+  local c=""
+  [ -f "$VOICE_CACHE" ] && c=$(cat "$VOICE_CACHE" 2>/dev/null)
+  if [ -n "$c" ] && probe_voice "$c"; then printf '%s' "$c"; return; fi
+  local v
+  for v in "Tingting" "Meijia" "Sinji" "Eddy (Chinese (China mainland))" "Flo (Chinese (China mainland))" "Sandy (Chinese (China mainland))" "Shelley (Chinese (China mainland))" "Grandma (Chinese (China mainland))"; do
+    if probe_voice "$v"; then printf '%s' "$v" > "$VOICE_CACHE"; printf '%s' "$v"; return; fi
+  done
+  : > "$VOICE_CACHE"
+}
+
+voice_label() {
+  if [ -n "@@{1:-}" ]; then echo "$1"; else echo "系统默认"; fi
+}
+
+ts()  { date '+%F %T'; }
+log() { printf '%s\t%s\n' "$(ts)" "$*" >> "$LOG"; }
+
+usage() {
+  cat <<'USAGEEOF'
+voice-alert — 用语音 + 通知条提醒用户（macOS）
+
+  voice-alert [选项] "要说的内容"
+  voice-alert --code 834291        验证码：逐位慢读并重复
+  voice-alert stop | status | doctor
+  voice-alert watch on|off          待命模式：开启后长任务也会出声
+
+选项:
+  --style done|progress|code|urgent|plain   预设语气（默认 progress）
+  --voice NAME      指定音色；默认自动挑一个可用的中文音色
+  --rate N          语速（默认 185）
+  --repeat N        重复次数（默认 1；urgent=2，code=2）
+  --interval SEC    重复间隔秒数（默认 20）
+  --no-chime        不加提示音
+  --no-banner       不弹通知条
+  --keep-volume     不改系统音量/静音状态
+  --wait            前台播放并等待结束（默认后台，立即返回）
+USAGEEOF
+}
+
+SAVED_MUTED=""; SAVED_VOL=""; TOUCHED=0
+
+prepare_audio() {
+  [ "${KEEP_VOLUME:-0}" = "1" ] && return 0
+  SAVED_MUTED=$(osascript -e 'output muted of (get volume settings)' 2>/dev/null)
+  SAVED_VOL=$(osascript -e 'output volume of (get volume settings)' 2>/dev/null)
+  case "$SAVED_MUTED" in true) osascript -e 'set volume without output muted' >/dev/null 2>&1; TOUCHED=1;; esac
+  if [ -n "$SAVED_VOL" ] && [ "$SAVED_VOL" -lt 45 ] 2>/dev/null; then
+    osascript -e 'set volume output volume 60' >/dev/null 2>&1; TOUCHED=1
+  fi
+}
+
+restore_audio() {
+  [ "$TOUCHED" = "1" ] || return 0
+  [ -n "$SAVED_VOL" ] && osascript -e "set volume output volume $SAVED_VOL" >/dev/null 2>&1
+  [ "$SAVED_MUTED" = "true" ] && osascript -e 'set volume with output muted' >/dev/null 2>&1
+  TOUCHED=0
+}
+
+acquire_lock() {
+  local waited=0
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    if [ -d "$LOCK" ]; then
+      local mtime age
+      mtime=$(stat -f %m "$LOCK" 2>/dev/null || echo 0)
+      age=$(( $(date +%s) - mtime ))
+      # 持锁进程已经死了 → 立刻清掉陈旧锁，否则后来者会干等三分钟再补播一堆
+      lp=$(cat "$LOCK/pid" 2>/dev/null || echo "")
+      if [ -n "$lp" ] && ! kill -0 "$lp" 2>/dev/null; then
+        rm -rf "$LOCK" 2>/dev/null; continue
+      fi
+      if [ "$age" -gt 120 ]; then rm -rf "$LOCK" 2>/dev/null; continue; fi
+    fi
+    sleep 0.2; waited=$((waited+1))
+    [ "$waited" -ge 900 ] && return 0
+  done
+  echo $$ > "$LOCK/pid" 2>/dev/null
+}
+release_lock() { rm -rf "$LOCK" 2>/dev/null; }
+
+chime() { [ -f "$SOUNDS/$1.aiff" ] && afplay -v 1.2 "$SOUNDS/$1.aiff" 2>/dev/null; }
+
+speak() {
+  local text="$1" rate="${2:-$RATE}" pid st=0
+  if [ -n "$VOICE" ]; then
+    say -v "$VOICE" -r "$rate" -- "$text" 2>/dev/null &
+  else
+    say -r "$rate" -- "$text" 2>/dev/null &
+  fi
+  pid=$!
+  echo "$pid" > "$STATE/say.pid" 2>/dev/null
+  wait "$pid" 2>/dev/null; st=$?
+  rm -f "$STATE/say.pid" 2>/dev/null
+  # 指定音色念不出来时退回系统默认音色
+  [ "$st" -ne 0 ] && say -r "$rate" -- "$text" 2>/dev/null
+  return 0
+}
+
+digits_cn() {
+  sed -e 's/0/零、/g; s/1/一、/g; s/2/二、/g; s/3/三、/g; s/4/四、/g' \
+      -e 's/5/五、/g; s/6/六、/g; s/7/七、/g; s/8/八、/g; s/9/九、/g' <<< "$1"
+}
+
+payload() {
+  case "$STYLE" in
+    code)
+      if [ "$NO_CHIME" = "0" ]; then chime "Sosumi"; sleep 0.25; chime "Sosumi"; sleep 0.3; fi
+      local cn; cn=$(digits_cn "$TEXT")
+      speak "需要验证码。" 180
+      speak "验证码是，$cn" 135
+      sleep 0.7
+      speak "再说一遍，$cn" 125
+      speak "请把验证码发给我。" 180
+      ;;
+    done)
+      [ "$NO_CHIME" = "1" ] || chime "Glass"
+      speak "完成了。$TEXT"
+      ;;
+    progress)
+      [ "$NO_CHIME" = "1" ] || chime "Tink"
+      speak "$TEXT"
+      ;;
+    urgent)
+      [ "$NO_CHIME" = "1" ] || { chime "Frog"; sleep 0.4; }
+      speak "$TEXT" 190
+      ;;
+    *) speak "$TEXT" ;;
+  esac
+}
+
+banner() {
+  [ "$NO_BANNER" = "1" ] && return 0
+  local title="DeepSeek Harness"
+  case "$STYLE" in
+    code) title="需要验证码" ;;
+    done) title="任务完成" ;;
+    urgent) title="需要你处理" ;;
+  esac
+  local esc="$TEXT"
+  esc="${esc//\"/\\\"}"
+  osascript -e "display notification \"$esc\" with title \"$title\" sound name \"Glass\"" >/dev/null 2>&1
+}
+
+STYLE="progress"; TEXT=""; VOICE="$DEFAULT_VOICE"; RATE=185
+REPEAT=""; INTERVAL=20; NO_CHIME=0; NO_BANNER=0; WAIT=0; KEEP_VOLUME=0
+
+[ $# -eq 0 ] && { usage; exit 0; }
+
+case "$1" in
+  --help|-h|help) usage; exit 0 ;;
+  --version|-V) echo "voice-alert $VERSION"; exit 0 ;;
+  doctor)
+    echo "macOS : $(sw_vers -productVersion 2>/dev/null)  $(uname -m)"
+    echo "script: $0"
+    echo "voice : $(voice_label "$(detect_voice)")"
+    echo "audio : $(osascript -e 'output volume of (get volume settings)' 2>/dev/null) / muted $(osascript -e 'output muted of (get volume settings)' 2>/dev/null)"
+    echo "中文音色:"
+    say -v '?' 2>/dev/null | grep 'zh_' | sed 's/[[:space:]]*#.*//' | head -6 | sed 's/^/  - /'
+    echo "state : $STATE"
+    exit 0 ;;
+  status)
+    echo "voice : $(voice_label "$VOICE")"
+    echo "audio : $(osascript -e 'get volume settings' 2>/dev/null)"
+    echo "recent:"
+    tail -n 5 "$LOG" 2>/dev/null | cut -f2- | sed 's/^/  /'
+    if [ -f "$WATCH_FILE" ] && [ "$(cat "$WATCH_FILE")" -gt "$(date +%s)" ]; then
+      echo "watch : 开（剩 $(( ($(cat "$WATCH_FILE") - $(date +%s)) / 60 )) 分钟）"
+    else echo "watch : 关"; fi
+    [ -d "$LOCK" ] && echo "state : 正在播放" || echo "state : 空闲"
+    exit 0 ;;
+  stop)
+    date +%s > "$STOP"
+    # 掐掉正在播的那句和还在排队的重复循环，否则 stop 之后还会再念几遍
+    if [ -f "$STATE/loop.pid" ]; then
+      kill "$(cat "$STATE/loop.pid" 2>/dev/null)" 2>/dev/null
+      rm -f "$STATE/loop.pid"
+    fi
+    # 只掐我们自己的播放进程，别误伤系统里别的 say
+    if [ -f "$STATE/say.pid" ]; then
+      kill "$(cat "$STATE/say.pid" 2>/dev/null)" 2>/dev/null
+      rm -f "$STATE/say.pid"
+    fi
+    echo "$(ts)	STOP" >> "$LOG"
+    echo "已停止重复提醒"; exit 0 ;;
+  watch)
+    case "${2:-show}" in
+      off)
+        rm -f "$WATCH_FILE"
+        echo "待命模式：关"; exit 0 ;;
+      on)
+        hours="${3:-4}"
+        exp=$(( $(date +%s) + hours * 3600 ))
+        echo "$exp" > "$WATCH_FILE"
+        echo "待命模式：开，到 $(date -r "$exp" '+%H:%M') 自动结束"
+        exit 0 ;;
+    esac
+    if [ -f "$WATCH_FILE" ] && [ "$(cat "$WATCH_FILE")" -gt "$(date +%s)" ]; then
+      echo "待命模式：开（还剩 $(( ($(cat "$WATCH_FILE") - $(date +%s)) / 60 )) 分钟）"
+    else
+      echo "待命模式：关"
+    fi
+    exit 0 ;;
+esac
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --style) STYLE="$2"; shift 2 ;;
+    --voice) VOICE="$2"; shift 2 ;;
+    --rate)  RATE="$2"; shift 2 ;;
+    --repeat) REPEAT="$2"; shift 2 ;;
+    --interval) INTERVAL="$2"; shift 2 ;;
+    --code)  STYLE="code"; TEXT="$2"; shift 2 ;;
+    --no-chime) NO_CHIME=1; shift ;;
+    --no-banner) NO_BANNER=1; shift ;;
+    --keep-volume) KEEP_VOLUME=1; shift ;;
+    --wait) WAIT=1; shift ;;
+    -*) echo "未知选项: $1" >&2; exit 2 ;;
+    *) TEXT="$1"; shift ;;
+  esac
+done
+
+[ -z "$TEXT" ] && { echo "缺少要播报的内容" >&2; exit 2; }
+[ -n "$VOICE" ] || VOICE=$(detect_voice)
+
+case "$STYLE" in
+  code)   [ -z "$REPEAT" ] && REPEAT=2 ;;
+  urgent) [ -z "$REPEAT" ] && REPEAT=2 ;;
+  *)      [ -z "$REPEAT" ] && REPEAT=1 ;;
+esac
+
+# 防叠播：20 秒内已经播过就不再插队（验证码除外）。否则连着几次 urgent
+# 会像卡带一样反复念，正是用户抱怨的问题。
+if [ "$STYLE" != "code" ]; then
+  _now=$(date +%s); _last=$(cat "$STATE/last_play" 2>/dev/null || echo 0)
+  if [ $((_now - _last)) -lt 20 ]; then
+    printf '%s\t%s\tSKIP(20秒内已播报)\n' "$(ts)" "$TEXT" >> "$LOG"
+    exit 0
+  fi
+fi
+echo "$(date +%s)" > "$STATE/last_play"
+
+run_once() {
+  acquire_lock
+  trap 'restore_audio; release_lock' EXIT
+  prepare_audio
+  log "$STYLE	$TEXT	($1/$REPEAT)"
+  payload
+  banner
+  restore_audio
+  trap - EXIT
+  release_lock
+}
+
+if [ "$WAIT" = "1" ]; then
+  n=1
+  while [ "$n" -le "$REPEAT" ]; do
+    run_once "$n"
+    n=$((n+1))
+    [ "$n" -le "$REPEAT" ] && sleep "$INTERVAL"
+  done
+  exit 0
+fi
+
+(
+  n=1
+  while [ "$n" -le "$REPEAT" ]; do
+    if [ -f "$STOP" ]; then
+      s=$(stat -f %m "$STOP" 2>/dev/null || echo 0)
+      [ "$s" -ge "$STARTED" ] && break
+    fi
+    run_once "$n"
+    n=$((n+1))
+    [ "$n" -le "$REPEAT" ] && sleep "$INTERVAL"
+  done
+) >/dev/null 2>&1 &
+echo $! > "$STATE/loop.pid" 2>/dev/null
+disown 2>/dev/null
+exit 0
